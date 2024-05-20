@@ -170,9 +170,10 @@ libtorch
 *.csv
 *.json
 *.pt
+*.onnx
 
 models/data
-models/runtime_onnx
-models/runtime_torchscript
+runtimes/runtime_onnx
+runtimes/runtime_torchscript
 
 *.DS_Store
