@@ -48,7 +48,7 @@ con = duckdb.connect("../test.db")
 
 # %%
 def load_iris():
-    model_path = f"{args.path}/models/iris_d1_w128.pt"
+    model_path = "../models/iris_d1_w128.pt"
     load_iris.model = torch.jit.load(model_path)
     return True
 
