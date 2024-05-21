@@ -110,7 +110,7 @@ if drop_table:
     con.sql(f"DROP TABLE IF EXISTS times")
     
 if not has_table:
-    con.sql(f"CREATE TABLE times (dataset varchar, workload integer, move integer, load integer, predict integer, ts timestamp DEFAULT current_timestamp)")
+    con.sql(f"CREATE TABLE times (dataset varchar, pipeline varchar, workload integer, move integer, load integer, predict integer, ts timestamp DEFAULT current_timestamp)")
 
 con.sql(f"INSERT INTO times (dataset, pipeline, workload, move, load, predict) SELECT * FROM times_df")
 con.sql(f"SELECT * FROM times").show()
