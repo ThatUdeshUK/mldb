@@ -16,7 +16,6 @@ import pyarrow as pa
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("dir")
 parser.add_argument("workload")
 args = parser.parse_args()
 
@@ -60,8 +59,6 @@ con.create_function("load_iris", load_iris, [], BOOLEAN, side_effects=True)
 res = con.sql("SELECT load_iris()").show()
 
 et = time.perf_counter_ns()
-times["load"] = (et - st)/1000
-
 # %% [markdown]
 # ### Predict
 
