@@ -172,8 +172,10 @@ libtorch
 *.pt
 *.onnx
 
+data/*
 models/data
 runtimes/runtime_onnx
 runtimes/runtime_torchscript
 
 *.DS_Store
+eval/*.out
