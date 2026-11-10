@@ -18,6 +18,12 @@
 #     QUERIES="q2_knn16 q2_knn32" bash evaluation/run.sh                # query variants by file name
 #     BENCHMARK=all RUNS="1" bash evaluation/run.sh                     # every benchmark with an ipdb/ dir
 #     DISABLED_OPTIMIZERS="limit_to_filter" bash evaluation/run.sh      # ablations
+#     JOIN_DECOMPOSITION=never bash evaluation/run.sh                   # ablation: pairwise LLM joins
+#
+# LLM join decomposition is ENFORCED by default (SET join_decomposition = 'always'): every LLM join predicate
+# that qualifies is rewritten into per-side extractions, with no cost-based skip and no runtime fallback to
+# pairwise inference (both exist only in 'auto'). After each query the "[decomp: ...]" note from the profile
+# is printed; a join that still ran pairwise (e.g. "no usable rewrite" when the planning call fails) is flagged.
 set -uo pipefail
 
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,8 +36,18 @@ RUNS=(${RUNS:-1 2 3})
 LLM_BATCH_SIZE="${LLM_BATCH_SIZE:-16}"   # SET ml_batch_size
 LLM_NO_THREADS="${LLM_NO_THREADS:-16}"   # SET llm_no_threads (concurrent LLM requests)
 THREADS="${THREADS:-1}"                  # SET threads (DuckDB execution threads)
-DISABLED_OPTIMIZERS="${DISABLED_OPTIMIZERS:-}"   # e.g. limit_to_filter, join_decomposition
+DISABLED_OPTIMIZERS="${DISABLED_OPTIMIZERS:-}"   # e.g. limit_to_filter
+JOIN_DECOMPOSITION="${JOIN_DECOMPOSITION:-always}"   # SET join_decomposition: always (enforced) | auto | never
 RESULTS_ROOT="${RESULTS_ROOT:-results_icde}"
+case "$JOIN_DECOMPOSITION" in
+  always|auto|never) ;;
+  *) echo "JOIN_DECOMPOSITION must be always, auto or never (got '$JOIN_DECOMPOSITION')" >&2; exit 1 ;;
+esac
+# Disabling the optimizer would silently override the enforced mode; use JOIN_DECOMPOSITION=never instead.
+if [ "$JOIN_DECOMPOSITION" != never ] && [[ ",${DISABLED_OPTIMIZERS// /}," == *",join_decomposition,"* ]]; then
+  echo "DISABLED_OPTIMIZERS contains join_decomposition, which overrides JOIN_DECOMPOSITION=$JOIN_DECOMPOSITION." >&2
+  echo "For the pairwise ablation use JOIN_DECOMPOSITION=never instead." >&2; exit 1
+fi
 case "$RESULTS_ROOT" in /*) ;; *) RESULTS_ROOT="$EVAL_DIR/$RESULTS_ROOT" ;; esac
 
 if [ "$BENCHMARK" = all ]; then
@@ -76,7 +92,7 @@ DISABLE_SQL=""
 echo "BENCHMARK: $BENCHMARK  MODEL: $MODEL  BATCH: $LLM_BATCH_SIZE  LLM_THREADS: $LLM_NO_THREADS  THREADS: $THREADS"
 echo "DB: $DB_PATH (read-only)"
 echo "OUT: $OUT_DIR"
-echo "QUERIES: ${QUERIES[*]}  RUNS: ${RUNS[*]}${DISABLED_OPTIMIZERS:+  DISABLED_OPTIMIZERS: $DISABLED_OPTIMIZERS}"
+echo "QUERIES: ${QUERIES[*]}  RUNS: ${RUNS[*]}  JOIN_DECOMPOSITION: $JOIN_DECOMPOSITION${DISABLED_OPTIMIZERS:+  DISABLED_OPTIMIZERS: $DISABLED_OPTIMIZERS}"
 
 for RUN in "${RUNS[@]}"; do
   for QUERY in "${QUERIES[@]}"; do
@@ -96,6 +112,7 @@ ${DISABLE_SQL}
 SET threads = ${THREADS};
 SET ml_batch_size = ${LLM_BATCH_SIZE};
 SET llm_no_threads = ${LLM_NO_THREADS};
+SET join_decomposition = '${JOIN_DECOMPOSITION}';
 PRAGMA profile_output = '${STEM}.json';
 COPY (
 ${QUERY_CONTENT}
@@ -112,6 +129,15 @@ QUERY_SCOPE
       # iPDB prints "Total calls" per LLM operator (not for prompt-only table generation)
       CALLS=$(grep -o "Total calls: [0-9]*" "$STEM.log" | awk '{s+=$3; n++} END{if (n) printf ", %d LLM calls", s}')
       echo "  done in ${WALL}s, $(($(wc -l < "$STEM.csv") - 1)) rows${CALLS}"
+      # The optimizer tags each LLM join predicate with "[decomp: <note>]" in the profile (queries without
+      # an LLM join have none): "always" = decomposed; "..., no usable rewrite" = planning call failed, ran pairwise.
+      DECOMP="$(grep -o 'decomp: [^]"]*' "$STEM.json" 2>/dev/null | sed 's/^decomp: //' | sort -u | paste -sd ';' -)"
+      if [ -n "$DECOMP" ]; then
+        echo "  join decomposition: $DECOMP"
+        if [ "$JOIN_DECOMPOSITION" = always ] && [[ "$DECOMP" == *"no usable rewrite"* ]]; then
+          echo "  WARNING: an LLM join was NOT decomposed (ran pairwise) although JOIN_DECOMPOSITION=always"
+        fi
+      fi
     fi
   done
 done
