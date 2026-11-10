@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ground_truth/<query>.csv (columns a,b: the two ids of a true pair) for every query.
+"""Build ground_truth/<query>.csv (one per LIMIT sweep, shared by its variants) (columns a,b: the two ids of a true pair) for every query.
 
     same_sentiment / opposite_sentiment   from the review labels (review.scoreSentiment) in the SemBench DB.
         This is complete. SemBench's own Q7 ground truth stops at 5,000 rows because of the query's LIMIT
@@ -47,8 +47,12 @@ def same_movie_select(query_sql: str) -> str:
 
 def main():
     GT_DIR.mkdir(exist_ok=True)
-    for q in load_queries():
-        out = GT_DIR / f"{q.id}.csv"
+    done = set()
+    for q in load_queries(include_optional=True):
+        if q.gt_id in done:  # the variants of a LIMIT sweep share one file
+            continue
+        done.add(q.gt_id)
+        out = GT_DIR / f"{q.gt_id}.csv"
         kind = q.ground_truth
         if kind in ("same_sentiment", "opposite_sentiment"):
             op = "=" if kind == "same_sentiment" else "<>"
@@ -67,7 +71,7 @@ def main():
             sys.exit(f"{q.id}: unknown ground_truth '{kind}'")
         with open(out) as f:
             pairs = {frozenset(r) for r in list(csv.reader(f))[1:]}
-        print(f"{q.id:<15} {kind:<19} {len(pairs):>6} unordered true pairs -> {out.relative_to(REPO)}")
+        print(f"{q.gt_id:<15} {kind:<19} {len(pairs):>6} unordered true pairs -> {out.relative_to(REPO)}")
 
 
 if __name__ == "__main__":

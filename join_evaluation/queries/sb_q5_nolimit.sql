@@ -3,6 +3,7 @@
 -- description: All pairs of reviews of one movie with the SAME sentiment (65,280 candidate pairs).
 -- db: sembench_sf2000_icde.db
 -- limit: none
+-- optional: yes (expensive: run only when named in --queries)
 -- pair_columns: 1,2
 -- ground_truth: same_sentiment
 SELECT r1.id as id, r1.reviewId as reviewId1, r2.reviewId as reviewId2

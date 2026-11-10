@@ -5,7 +5,7 @@ Evaluates iPDB's semantic join decomposition and the decision of when to apply i
 
 | Plan item | What this measures |
 |---|---|
-| **E1**: decomposition across many joins, including ones that don't decompose | Every LLM join in the benchmarks, with and without LIMIT, plus a join that isn't attribute-based (`sm_tagline`) |
+| **E1**: decomposition across many joins, including ones that don't decompose | Every LLM join in the benchmarks, over a LIMIT sweep, plus a join that isn't attribute-based (`sm_tagline`) |
 | **E5**: do T1–T3 choose well against always-on, always-off and an oracle? | Arms `pairwise` / `decomposed` / `auto`, the offline oracle, wrong choices, the cost of wrong choices and wasted fallback cost |
 | **Step 0**: calibrate T2's runtime check | Arm `guarded` reports the four signals and the decision on every query, next to the quality decomposition actually loses |
 | §7 item 10: SemBench Q7 ground truth truncated by `LIMIT 5000` | Ground truth is rebuilt from the review labels (complete) |
@@ -21,17 +21,25 @@ they are left out. `pc_parts/ipdb/q5_split.sql` is identical to Q5.
 
 | Query | Source | Pairs | LIMIT | Ground truth |
 |---|---|---|---|---|
-| `sb_q5` | D1:Q5 | 65,280 (256 × 255 review rows) | 10 | same sentiment (review labels) |
-| `sb_q5_nolimit` | D1:Q5 without LIMIT (`q5_nolimit_split.sql`) | 65,280 | – | same sentiment |
+| `sb_q5_k{10,30,100,300,1000,5000}` | D1:Q5 (the paper's is k = 10) | 65,280 (256 × 255 review rows) | sweep | same sentiment (review labels) |
 | `sb_q6` | D1:Q6 | 65,280 | 10 | opposite sentiment |
-| `sb_q7` | D1:Q7 | 65,280 | 5000 | opposite sentiment |
-| `sb_q7_nolimit` | D1:Q7 without LIMIT (`q7_split.sql`) | 65,280 | – | opposite sentiment |
+| `sb_q7_k{10,30,100,300,1000,5000}` | D1:Q7 (the paper's is k = 5000) | 65,280 | sweep | opposite sentiment |
+| `sb_q5_nolimit` *(optional)* | D1:Q5 without LIMIT (`q5_nolimit_split.sql`) | 65,280 | – | same sentiment |
+| `sb_q7_nolimit` *(optional)* | D1:Q7 without LIMIT (`q7_split.sql`) | 65,280 | – | opposite sentiment |
 | `sb_q7_manual` | D1:Q7 decomposed by hand (`q7_alt.sql`), arm `manual` only | – | – | opposite sentiment |
 | `pc_q5` | D2:Q5, CPU–motherboard compatibility | 41 × 41 | – | `evaluation/results/pc_parts/ground_truth/q5.csv` |
 | `sm_tagline` | **New** (D3 data): which tagline belongs to which plot | 32 × 32 | – | same movie |
 
-The LIMIT / no-LIMIT pairs put the same join on both sides of T1's crossover (pairwise `min(P, k/s)` vs.
-decomposed `c_rewrite + d_R + d_S`). `sm_tagline` is the "relationship is not attribute-based" failure mode of
+**LIMIT sweep.** `sb_q5.sql` and `sb_q7.sql` declare `-- limits: 10, 30, 100, 300, 1000, 5000` and expand into
+one query per k (`sb_q5_k100`, ...); `--queries sb_q5` selects all of them, and they share `ground_truth/sb_q5.csv`.
+The sweep moves the same join across T1's crossover (decompose iff `min(P, k/s) >= 2 x (10 + d_R + d_S)`):
+with the true P = 65,280 and d_R = d_S = 256 that is k ≈ 105 at the default s = 0.1, and k ≈ 520 at the
+predicate's true selectivity (≈ 0.5). The decomposed arm's cost is roughly flat in k (it extracts every review
+once), the pairwise arm's grows with k, so the measured crossover is where they meet; `analyze.py` reports it next
+to T1's decision. The no-LIMIT queries are too expensive to run by default: they are `-- optional: yes` and run
+only when named (`--queries sb_q7_nolimit`).
+
+`sm_tagline` is the "relationship is not attribute-based" failure mode of
 paper §IV-B, with exact ground truth; it is new, so say so if it goes into the paper.
 
 The SemBench movie has 256 review rows but only 128 distinct `reviewId`s (each review appears twice), so the
@@ -69,8 +77,10 @@ ignored the error and returned 0 rows. Such runs (LLM calls but no tokens) are m
 
 **T1 and the SemBench joins.** `--explain` shows T1 estimating `pairwise 0 < 2x decomposed 32` for all five
 SemBench joins, even without LIMIT: DuckDB estimates the self-join's cardinality as 0, so `auto` keeps them
-pairwise. This is the plan's known caveat ("cardinality estimates ... make T1 err towards pairwise"); the
-evaluation measures its effect rather than working around it.
+pairwise at every k of the sweep. This is the plan's known caveat ("cardinality estimates ... make T1 err towards
+pairwise"). The evaluation measures its effect, and the sweep table also recomputes T1 offline with the true
+cardinalities (`-- true_cardinality: P, d_R, d_S` in the query file) to show what the cost model would decide
+with correct estimates.
 
 ## Running
 
@@ -80,6 +90,7 @@ From the repo root, with the `*_icde.db` databases built (`evaluation/setup_ipdb
 python3 join_evaluation/make_ground_truth.py               # once; no LLM calls
 python3 join_evaluation/run.py --explain                   # T1's decision per query; <= 1 planning call each
 python3 join_evaluation/run.py --queries pc_q5 sm_tagline  # cheap queries first
+python3 join_evaluation/run.py --queries sb_q5 sb_q7 --arms pairwise decomposed auto  # the LIMIT sweep
 python3 join_evaluation/run.py                             # everything: all queries x arms, run 1, gpt6luna
 python3 join_evaluation/run.py --model sonnet55 --runs 1 2 3
 python3 join_evaluation/analyze.py                         # -> join_evaluation/analysis/report.md
@@ -109,6 +120,7 @@ iPDB's output (call counts, the planning call's rewrite, the runtime check) and 
 | `decisions.csv` | Oracle vs. `auto` and `guarded`: wrong runs, cost regret, quality regret |
 | `wasted.csv` | Fallback runs: extra calls, cost and latency against running pairwise directly |
 | `step0.csv` | Runtime-check signals and decision vs. whether decomposition really loses quality |
+| `sweep.csv` | LIMIT sweep: pairwise vs. decomposed measured cost per k, the oracle, `auto`'s T1 note, and T1 recomputed with true cardinalities (configured s, and true s) |
 
 ## Metrics and caveats
 

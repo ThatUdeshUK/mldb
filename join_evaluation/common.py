@@ -47,6 +47,14 @@ class Query:
     arms: list[str] = field(default_factory=lambda: list(DEFAULT_ARMS))
     settings: list[str] = field(default_factory=list)  # per-query session settings, applied in every arm
     meta: dict = field(default_factory=dict)
+    family: str = ""              # the query file's id; a LIMIT sweep expands one file into <family>_k<k>
+    optional: bool = False        # left out of the default set; run only when named in --queries
+    true_cardinality: tuple[float, float, float] | None = None  # (pairs P, left rows d_R, right rows d_S)
+
+    @property
+    def gt_id(self) -> str:
+        """Ground truth file stem: the variants of a LIMIT sweep share their family's ground truth."""
+        return self.family or self.id
 
     def db_path(self) -> Path:
         return DB_DIR / self.db
@@ -55,7 +63,9 @@ class Query:
         return self.sql.replace("<model>", model)
 
 
-def load_query(path: Path) -> Query:
+def load_query(path: Path) -> list[Query]:
+    """One query, or one per k if the file declares `-- limits: k1, k2, ...` (the SQL then says `LIMIT <limit>`
+    and the variants are named <id>_k<k>)."""
     meta, body = {}, []
     for line in path.read_text().splitlines():
         m = re.match(r"^\s*--\s*([a-z_]+):\s*(.*)$", line)
@@ -64,23 +74,34 @@ def load_query(path: Path) -> Query:
         elif not line.strip().startswith("--"):
             body.append(line)
     sql = "\n".join(body).strip().rstrip(";").strip()
-    limit = meta.get("limit", "none")
     a, b = (int(x) for x in meta["pair_columns"].split(","))
-    arms = [x.strip() for x in meta["arms"].split(",")] if "arms" in meta else list(DEFAULT_ARMS)
-    settings = [s.strip() + ";" for s in meta.get("settings", "").split(";") if s.strip()]
-    return Query(id=meta["id"], path=path, sql=sql, db=meta["db"],
-                 limit=None if limit == "none" else int(limit), pair_columns=(a, b),
-                 ground_truth=meta["ground_truth"], arms=arms, settings=settings, meta=meta)
+    common = dict(path=path, db=meta["db"], pair_columns=(a, b), ground_truth=meta["ground_truth"],
+                  arms=[x.strip() for x in meta["arms"].split(",")] if "arms" in meta else list(DEFAULT_ARMS),
+                  settings=[s.strip() + ";" for s in meta.get("settings", "").split(";") if s.strip()],
+                  meta=meta, optional=(meta.get("optional", "no").split() or ["no"])[0].lower() in ("yes", "true", "1"),
+                  true_cardinality=tuple(float(x) for x in meta["true_cardinality"].split(","))
+                  if "true_cardinality" in meta else None)
+    if "limits" in meta:
+        if "<limit>" not in sql:
+            raise SystemExit(f"{path.name}: declares limits but its SQL has no LIMIT <limit>")
+        return [Query(id=f"{meta['id']}_k{k}", sql=sql.replace("<limit>", str(k)), limit=k, family=meta["id"],
+                      **common)
+                for k in (int(x) for x in meta["limits"].split(","))]
+    limit = meta.get("limit", "none")
+    return [Query(id=meta["id"], sql=sql, limit=None if limit == "none" else int(limit), **common)]
 
 
-def load_queries(ids: list[str] | None = None) -> list[Query]:
-    queries = [load_query(p) for p in sorted(QUERY_DIR.glob("*.sql"))]
+def load_queries(ids: list[str] | None = None, include_optional: bool = False) -> list[Query]:
+    """All queries (optional ones only with include_optional), or those named in ids. A sweep's family id (e.g.
+    sb_q5) selects all of its variants."""
+    queries = [q for p in sorted(QUERY_DIR.glob("*.sql")) for q in load_query(p)]
     if ids:
-        unknown = set(ids) - {q.id for q in queries}
+        known = {q.id for q in queries} | {q.family for q in queries if q.family}
+        unknown = set(ids) - known
         if unknown:
-            raise SystemExit(f"Unknown queries: {sorted(unknown)}. Known: {[q.id for q in queries]}")
-        queries = [q for q in queries if q.id in ids]
-    return queries
+            raise SystemExit(f"Unknown queries: {sorted(unknown)}. Known: {sorted(known)}")
+        return [q for q in queries if q.id in ids or q.family in ids]
+    return [q for q in queries if include_optional or not q.optional]
 
 
 def stem(query: str, arm: str, model: str, run: int) -> str:

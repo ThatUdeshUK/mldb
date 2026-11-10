@@ -5,6 +5,8 @@
     summary.csv    mean per (query, model, arm)
     decisions.csv  oracle vs. the auto / guarded arms: wrong choices, cost of wrong choices, quality lost
     step0.csv      T2 runtime-check signals vs. the quality decomposition actually loses (calibration)
+    sweep.csv      LIMIT sweeps: measured cost of each arm per k vs. T1's decision (as run, and recomputed from the
+                   true cardinalities), i.e. where T1 puts the crossover and where it really is
     report.md      all of the above as tables, plus the rewrites the planning call produced
 
 Quality:  F1 against ground truth (pairs are unordered), or precision@k for LIMIT queries (any k true pairs are
@@ -19,6 +21,7 @@ Cost:     input/output tokens x prices.json. The planning call is counted as one
           report its tokens, so they are not in the token or USD columns.
 
 Usage: python3 join_evaluation/analyze.py [--delta 0.05] [--models gpt6luna] [--results DIR]
+       [--t1-selectivity 0.1] [--t1-min-speedup 2]
 """
 
 import argparse
@@ -169,13 +172,13 @@ def collect(results: Path, queries: dict, prices: dict, models: list | None) -> 
                    pred_pairs=None, ref_f1=None)
         if row["status"] == "ok":
             pred = read_pairs(results / f"{s}.csv", q.pair_columns)
-            if q.id not in gts:
-                gts[q.id] = read_pairs(GT_DIR / f"{q.id}.csv", (0, 1))
+            if q.gt_id not in gts:
+                gts[q.gt_id] = read_pairs(GT_DIR / f"{q.gt_id}.csv", (0, 1))
             if pred is not None:
                 row["pred_pairs"] = len(pred)
                 row["_pred"] = pred
-                if gts[q.id] is not None:
-                    p, r, f = prf(pred, gts[q.id])
+                if gts[q.gt_id] is not None:
+                    p, r, f = prf(pred, gts[q.gt_id])
                     row.update(precision=p, recall=r, f1=f, quality=p if q.limit else f)
         rows.append(row)
     # Reference F1: against the pairwise arm (same model; same run if there is one, else its first run)
@@ -214,7 +217,8 @@ def summarise(rows):
         ok = [r for r in rs if r["status"] == "ok"]
         s = {"query": q, "model": model, "arm": arm, "base_arm": rs[0]["base_arm"], "metric": rs[0]["metric"],
              "runs": len(rs), "ok": len(ok),
-             "choices": ", ".join(f"{c} x{n}" for c, n in Counter(r["choice"] for r in ok).most_common())}
+             "choices": ", ".join(f"{c} x{n}" for c, n in Counter(r["choice"] for r in ok).most_common()),
+             "decomp_note": "; ".join(sorted({r["decomp_note"] for r in rs if r["decomp_note"]}))}
         for k in NUMERIC:
             s[k] = mean(r[k] for r in ok)
         out.append(s)
@@ -296,6 +300,64 @@ def step0(rows, summary, delta):
     return out
 
 
+# T1's constants, mirroring iPDB (src/optimizer/split_predict_join_to_extract_predicate.cpp): costs in items,
+# pairwise = min(P, k / s), decomposed = c_rewrite + d_R + d_S, decompose iff pairwise >= min_speedup * decomposed.
+T1_REWRITE_COST = 10.0
+
+
+def t1(pairs, left, right, limit, selectivity, min_speedup):
+    pairwise = min(pairs, limit / selectivity) if limit else pairs
+    decomposed = T1_REWRITE_COST + left + right
+    return pairwise, decomposed, "decomposed" if pairwise >= min_speedup * decomposed else "pairwise"
+
+
+def gt_row_pairs(q) -> int | None:
+    """Matching row pairs (ordered, duplicates kept) = rows of the ground-truth file, which is built by the same
+    self-join as the query; divided by P this is the predicate's true selectivity."""
+    path = GT_DIR / f"{q.gt_id}.csv"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+
+def sweep(summary, queries, delta, selectivity, min_speedup):
+    """One row per (sweep family, model, k): measured pairwise vs. decomposed, the oracle, the auto arm's actual
+    T1 decision, and T1 recomputed from the true cardinalities (with the configured and the true selectivity)."""
+    by = {(s["query"], s["model"], s["arm"]): s for s in summary}
+    out = []
+    for q in sorted((q for q in queries.values() if q.family), key=lambda q: (q.family, q.limit)):
+        for model in sorted({s["model"] for s in summary if s["query"] == q.id}):
+            pw, dec, auto = (by.get((q.id, model, a)) for a in ("pairwise", "decomposed", "auto"))
+            row = {"family": q.family, "query": q.id, "model": model, "k": q.limit}
+            for name, s in (("pairwise", pw), ("decomposed", dec)):
+                ok = s and s["ok"]
+                for k in ("cost_usd", "calls", "tokens", "latency_s", "quality"):
+                    row[f"{name}_{k}"] = s[k] if ok else None
+            oracle = None
+            if pw and dec and pw["ok"] and dec["ok"]:
+                key = cost_key(pw, dec)
+                acceptable = pw["quality"] is not None and dec["quality"] is not None \
+                    and dec["quality"] >= pw["quality"] - delta
+                oracle = "decomposed" if acceptable and (dec[key] or 0) < (pw[key] or 0) else "pairwise"
+                row["cost_metric"] = key
+                row["measured_cheaper"] = "decomposed" if (dec[key] or 0) < (pw[key] or 0) else "pairwise"
+            row["oracle"] = oracle
+            row["auto_note"] = auto["decomp_note"] if auto else None
+            row["auto_executed"] = auto["choices"] if auto and auto["ok"] else None
+            if q.true_cardinality:
+                P, dR, dS = q.true_cardinality
+                pi, di, choice = t1(P, dR, dS, q.limit, selectivity, min_speedup)
+                row.update(t1_true_pairwise_items=pi, t1_true_decomposed_items=di, t1_true=choice)
+                matches = gt_row_pairs(q)
+                if matches:
+                    s_true = matches / P
+                    pi, _, choice = t1(P, dR, dS, q.limit, s_true, min_speedup)
+                    row.update(true_selectivity=s_true, t1_true_s_pairwise_items=pi, t1_true_s=choice)
+            out.append(row)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -340,7 +402,7 @@ def write_csv(path, rows):
 ARM_ORDER = {"pairwise": 0, "decomposed": 1, "auto": 2, "guarded": 3, "manual": 4}
 
 
-def report(rows, summary, dec, waste, s0, queries, delta, out_dir, results_dir):
+def report(rows, summary, dec, waste, s0, sw, queries, delta, out_dir, results_dir, selectivity, min_speedup):
     md = ["# Join decomposition evaluation", "",
           f"Generated by `join_evaluation/analyze.py` from `{results_dir}` "
           f"({len(rows)} runs). Quality is F1 against ground truth, or precision@k (P@k) for LIMIT queries; "
@@ -374,6 +436,26 @@ def report(rows, summary, dec, waste, s0, queries, delta, out_dir, results_dir):
                           ("cost in", "cost_metric", ""), ("oracle", "oracle", ""), ("arm executed", "arm_choices", ""),
                           ("wrong", "wrong_runs", ""), ("cost regret", "cost_regret", ""),
                           ("quality regret", "quality_regret", "")]) if dec else "_Needs the pairwise and decomposed arms._", ""]
+
+    md += ["## LIMIT sweep: T1's cost model vs. measured cost", "",
+           "T1 decomposes iff `min(P, k/s) >= min_speedup x (c_rewrite + d_R + d_S)` (in items). "
+           "`auto (as run)` is T1 on DuckDB's cardinality estimates (its plan note); "
+           f"`T1, true card.` recomputes it with the true P, d_R, d_S and s = {selectivity}; "
+           "`T1, true s` also uses the predicate's true selectivity (from ground truth). "
+           f"min_speedup = {min_speedup}, c_rewrite = {T1_REWRITE_COST:g}. "
+           "`measured cheaper` compares the pairwise and decomposed arms; the oracle also requires quality within "
+           f"{delta} of pairwise.", ""]
+    md += [md_table(sw, [("query", "family", ""), ("model", "model", ""), ("k", "k", ""),
+                         ("pairwise cost", "pairwise_cost_usd", "usd"), ("pairwise calls", "pairwise_calls", "int"),
+                         ("pairwise s", "pairwise_latency_s", "s"), ("pairwise P@k", "pairwise_quality", ""),
+                         ("decomp. cost", "decomposed_cost_usd", "usd"), ("decomp. calls", "decomposed_calls", "int"),
+                         ("decomp. s", "decomposed_latency_s", "s"), ("decomp. P@k", "decomposed_quality", ""),
+                         ("measured cheaper", "measured_cheaper", ""), ("oracle", "oracle", ""),
+                         ("auto (as run)", "auto_note", ""), ("auto executed", "auto_executed", ""),
+                         ("T1 pairwise items", "t1_true_pairwise_items", "int"),
+                         ("T1 decomp. items", "t1_true_decomposed_items", "int"),
+                         ("T1, true card.", "t1_true", ""), ("true s", "true_selectivity", ""),
+                         ("T1, true s", "t1_true_s", "")]) if sw else "_No LIMIT sweep runs._", ""]
 
     md += ["## Wasted fallback cost", "",
            "Runs where the runtime check fell back to pairwise, against running pairwise directly.", ""]
@@ -415,11 +497,15 @@ def main():
     ap.add_argument("--out", type=Path, default=ANALYSIS_DIR)
     ap.add_argument("--models", nargs="*", help="only these models")
     ap.add_argument("--delta", type=float, default=0.05, help="quality drop the oracle tolerates (default 0.05)")
+    ap.add_argument("--t1-selectivity", type=float, default=0.1,
+                    help="s for the recomputed T1 decision (iPDB's join_decomposition_selectivity, default 0.1)")
+    ap.add_argument("--t1-min-speedup", type=float, default=2.0,
+                    help="min_speedup for the recomputed T1 decision (join_decomposition_min_speedup, default 2)")
     args = ap.parse_args()
 
-    queries = {q.id: q for q in load_queries()}
+    queries = {q.id: q for q in load_queries(include_optional=True)}
     prices = {k: v for k, v in json.loads((HERE / "prices.json").read_text()).items() if not k.startswith("_")}
-    missing_gt = [q for q in queries if not (GT_DIR / f"{q}.csv").exists()]
+    missing_gt = sorted({q.gt_id for q in queries.values() if not (GT_DIR / f"{q.gt_id}.csv").exists()})
     if missing_gt:
         print(f"[warn] no ground truth for {missing_gt}: run make_ground_truth.py (quality left empty)", file=sys.stderr)
     rows = collect(args.results, queries, prices, args.models)
@@ -430,9 +516,12 @@ def main():
     dec = decisions(summary, rows, args.delta)
     waste = wasted(rows, summary)
     s0 = step0(rows, summary, args.delta)
-    for name, data in (("runs", rows), ("summary", summary), ("decisions", dec), ("step0", s0), ("wasted", waste)):
+    sw = sweep(summary, queries, args.delta, args.t1_selectivity, args.t1_min_speedup)
+    for name, data in (("runs", rows), ("summary", summary), ("decisions", dec), ("step0", s0), ("wasted", waste),
+                       ("sweep", sw)):
         write_csv(args.out / f"{name}.csv", data)
-    report(rows, summary, dec, waste, s0, queries, args.delta, args.out, args.results)
+    report(rows, summary, dec, waste, s0, sw, queries, args.delta, args.out, args.results,
+           args.t1_selectivity, args.t1_min_speedup)
     unpriced = sorted({r["model"] for r in rows} - set(prices))
     if unpriced:
         print(f"[info] no price for {unpriced} in prices.json: cost left empty, the oracle compares LLM calls")
