@@ -1,0 +1,5 @@
+results/
+analysis/
+__pycache__/
+# derived from the review labels by make_ground_truth.py (large; regenerate instead of committing)
+ground_truth/sb_*.csv
