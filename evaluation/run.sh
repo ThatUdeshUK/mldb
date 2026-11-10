@@ -13,6 +13,7 @@
 # Every setting can be overridden from the environment:
 #     bash evaluation/run.sh                                            # sembench_movies, q1..q10, runs 1 2 3
 #     MODEL=gpt6luna RUNS="1" bash evaluation/run.sh
+#     MODEL=sonnet55 BENCHMARK=all RUNS="1" bash evaluation/run.sh      # Claude Sonnet (register via setup_ipdb_icde.sh)
 #     BENCHMARK=pc_parts QUERIES="q1 q4" bash evaluation/run.sh
 #     QUERIES="q2_knn16 q2_knn32" bash evaluation/run.sh                # query variants by file name
 #     BENCHMARK=all RUNS="1" bash evaluation/run.sh                     # every benchmark with an ipdb/ dir

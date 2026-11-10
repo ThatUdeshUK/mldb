@@ -12,10 +12,13 @@
 # and registers every model below in each DB (skipping ones that are already there). Re-running is
 # safe: existing DBs are kept, only missing models are added. FORCE=1 rebuilds the DBs.
 #
-# Models use the persistent iPDB secrets `openai` and `gemini` (check: SELECT name FROM duckdb_secrets();).
+# Models use the persistent iPDB secrets `openai`, `gemini` and `anth` (check: SELECT name FROM duckdb_secrets();).
 # If one is missing, create it first, e.g.
 #   CREATE PERSISTENT SECRET openai (TYPE http, bearer_token '<OPENAI_API_KEY>');
 #   CREATE PERSISTENT SECRET gemini (TYPE http, bearer_token '<GEMINI_API_KEY>');
+#   CREATE PERSISTENT SECRET anth   (TYPE http, bearer_token '<ANTHROPIC_API_KEY>');
+# Claude goes through Anthropic's OpenAI-compatible endpoint (api.anthropic.com/v1/chat/completions), which
+# accepts the key as a bearer token. A model registered with a bad key returns NULLs (0 tokens), not an error.
 #
 # Usage: bash evaluation/setup_ipdb_icde.sh   (from the repo root or evaluation/)
 set -euo pipefail
@@ -25,6 +28,7 @@ IPDB="../iPDb/build/release_api/ipdb"
 REQ_PER_MIN="${REQ_PER_MIN:-500}"
 OPENAI_API="https://api.openai.com/v1/"
 GEMINI_API="https://generativelanguage.googleapis.com/v1beta/openai/"
+ANTHROPIC_API="https://api.anthropic.com/v1/"
 
 # name used in queries (LLM <name> ...) | provider model id | API | secret
 MODELS="
@@ -32,6 +36,7 @@ gpt6luna      gpt-6-luna            $OPENAI_API openai
 gemini38flash gemini-3.8-flash      $GEMINI_API gemini
 gemini35lite  gemini-3.5-flash-lite $GEMINI_API gemini
 gemini4       gemini-4-argon        $GEMINI_API gemini
+sonnet55      claude-sonnet-5-5     $ANTHROPIC_API anth
 "
 
 build_db() {  # build_db <db> <source db> <SQL creating the tables from schema src>
