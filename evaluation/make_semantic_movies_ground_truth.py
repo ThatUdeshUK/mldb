@@ -28,14 +28,16 @@ q2  language of every movie, from its title (5,000 movie rows = 4,999 ids; "Joy"
 
 q3  negative reviews of 'Star Trek' (320 reviews of the 2009 film)
     Rule: review.sentiment = 'NEGATIVE' (the critic's own RT rotten verdict): 20 reviews.
-    All 320 texts were read: the 20 read negative, but some RT labels and texts disagree in tone. Those are
-    written to q3_ambiguous.csv (negative label + mixed text, or positive label + negative / mixed / no-opinion
-    text) so a lenient evaluation can accept them either way, as for pc_parts q4.
+    All 320 texts were read: the 20 read negative, but some RT labels and texts disagree in tone (negative label +
+    mixed text, or positive label + negative / mixed / no-opinion text). q3.csv holds the 20 negatives plus those
+    positives, with columns negative (the GT) and ambiguous, so a lenient evaluation can accept the ambiguous ones
+    either way; q3_ambiguous.csv lists them with a note.
 
 q4  all MPA maturity ratings in the US (pure generation, no input rows)
     The five current MPA (MPAA) film ratings G, PG, PG-13, R, NC-17 with the MPA's own descriptions.
-    q4_ambiguous.csv lists labels that are not current MPA ratings but are often listed with them (NR / Unrated,
-    and the retired X, M, GP); a lenient evaluation can ignore them instead of counting them as wrong.
+    q4.csv also holds, with ambiguous = True, labels that are not current MPA ratings but are often listed with
+    them (NR / Unrated, and the retired X, M, GP); a lenient evaluation ignores them instead of counting them as
+    wrong (also listed in q4_ambiguous.csv).
 
 Usage: .venv/bin/python evaluation/make_semantic_movies_ground_truth.py
        SEMANTIC_MOVIES_DB=/path/benchmark_duckdb.db SEMANTIC_MOVIES_GT_DIR=/path/out ... (overrides)
@@ -259,14 +261,23 @@ def main():
         assert reviews.loc[rid, "review"].startswith(prefix), f"q3 label {rid} no longer matches the data"
     neg = reviews[reviews.sentiment == "NEGATIVE"]
     assert len(neg) == STAR_TREK_NEGATIVE, f"expected {STAR_TREK_NEGATIVE} negative reviews, got {len(neg)}"
-    neg[["movie_id", "review_id", "review", "score"]].to_csv(OUT / "q3.csv", index=False)
     amb = reviews.loc[list(Q3_AMBIGUOUS)].copy()
     amb["note"] = amb.review_id.map(lambda r: Q3_AMBIGUOUS[r][1])
     amb[["movie_id", "review_id", "sentiment", "review", "note"]].to_csv(OUT / "q3_ambiguous.csv", index=False)
+    # q3.csv = the negatives plus the ambiguous positives, so the evaluator (which only gets this file) can score
+    # strictly (negative = sentiment NEGATIVE) and leniently (ambiguous rows ignored on both sides).
+    q3 = reviews[(reviews.sentiment == "NEGATIVE") | reviews.review_id.isin(list(Q3_AMBIGUOUS))].copy()
+    q3["negative"] = q3.sentiment == "NEGATIVE"
+    q3["ambiguous"] = q3.review_id.isin(list(Q3_AMBIGUOUS))
+    q3[["movie_id", "review_id", "negative", "ambiguous", "score", "review"]].to_csv(OUT / "q3.csv", index=False)
 
     # q4 ------------------------------------------------------------------------------------------------------
-    pd.DataFrame(MPA_RATINGS, columns=["label", "name", "explanation"]).to_csv(OUT / "q4.csv", index=False)
-    pd.DataFrame(Q4_AMBIGUOUS, columns=["label", "note"]).to_csv(OUT / "q4_ambiguous.csv", index=False)
+    # q4.csv = the five ratings (ambiguous = False) plus the non-MPA labels a lenient evaluation ignores (True)
+    q4 = pd.DataFrame(MPA_RATINGS, columns=["label", "name", "explanation"]).assign(ambiguous=False)
+    q4_amb = pd.DataFrame(Q4_AMBIGUOUS, columns=["label", "explanation"]).assign(name="", ambiguous=True)
+    pd.concat([q4, q4_amb])[["label", "name", "ambiguous", "explanation"]].to_csv(OUT / "q4.csv", index=False)
+    q4_amb[["label", "explanation"]].rename(columns={"explanation": "note"}).to_csv(OUT / "q4_ambiguous.csv",
+                                                                                    index=False)
 
     n_mc = int((q1.main_character.fillna("") != "").sum() + (q1.no_character.astype(str) == "True").sum())
     print(f"q1: {len(q1)} movies; accepted genres for {int((q1.accepted_genres != '').sum())} "
@@ -274,7 +285,7 @@ def main():
           + ("" if MAIN_CHARACTER_CSV.exists() else f"  (no {MAIN_CHARACTER_CSV.name}: run the labeller)"))
     print(f"q2: {len(q2)} movies with a language ({len(no_lang)} without one left out); "
           f"top: {q2.language.value_counts().head(5).to_dict()}")
-    print(f"q3: {len(neg)} negative of {len(reviews)} reviews (+ {len(amb)} ambiguous)")
+    print(f"q3: {int(q3.negative.sum())} negative of {len(reviews)} reviews ({int(q3.ambiguous.sum())} ambiguous)")
     print(f"q4: {len(MPA_RATINGS)} ratings (+ {len(Q4_AMBIGUOUS)} ambiguous)")
     print(f"written to {OUT}")
 
