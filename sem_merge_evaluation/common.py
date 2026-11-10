@@ -51,6 +51,12 @@ OPS = {
                    "language", "string", "gt_language"),
 }
 
+# Execution defaults, matching the iPDB runs (evaluation/run.sh: ml_batch_size = 16, llm_no_threads = 16):
+# 16 rows per LLM call (row marshalling) and 16 concurrent LLM requests.
+DEFAULT_MODE = "batch"
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_WORKERS = 16
+
 # Two-operator combinations. The first operator is always a filter; ops[0] is applied before ops[1] in the
 # "separate" strategy.
 WORKLOADS = {
@@ -64,13 +70,12 @@ WORKLOADS = {
 #   separate       - op1 on all rows, op2 on op1's survivors (the usual pipeline; for filter|project the
 #                    projection only runs on rows that pass the filter)
 #   separate_rev   - filter|filter only: op2 first, then op1 on its survivors
-#   independent    - op1 and op2 each on all rows, concurrently; results combined afterwards (no pruning, but
-#                    the latency of one operator rather than two)
 #   separate_1out  - control: like "separate", but each operator is a single-output semantic project (the same
 #                    operator and prompt format as "merged"), so the merge effect is not confounded with the
 #                    filter-vs-project prompt
 #   merged         - one semantic project on all rows that extracts both outputs in one call per row
-STRATEGIES = ["separate", "separate_rev", "independent", "separate_1out", "merged"]
+# Every unmerged strategy runs the second operator only on the rows the first filter keeps.
+STRATEGIES = ["separate", "separate_rev", "separate_1out", "merged"]
 FILTER_ONLY_STRATEGIES = {"separate_rev"}
 
 STEM_RE = re.compile(r"^(?P<workload>[^|]+)\|strategy:(?P<strategy>[^|]+)\|model:(?P<model>[^|]+)"

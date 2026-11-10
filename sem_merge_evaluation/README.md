@@ -35,13 +35,15 @@ JSON framing).
 
 ## Strategies
 
-| Strategy | Execution | LLM calls (N rows, s = op1 selectivity) |
+| Strategy | Execution | Rows sent to the LLM (N rows, s = op1 selectivity) |
 |---|---|---|
 | `separate` | op1 on all rows, op2 on op1's survivors: the usual pipeline | N + sN |
 | `separate_rev` | filter \| filter only: op2 first, then op1 on its survivors | N + s₂N |
-| `independent` | op1 and op2 on all rows, concurrently; combined afterwards | 2N |
 | `separate_1out` | control: like `separate`, but each operator is a single-output `semantic_project` (the same operator and prompt format as `merged`) | N + sN |
 | `merged` | one `semantic_project` on all rows extracting both outputs | N |
+
+Without merging, the second operator never sees a row the first filter eliminated. With 16 rows per call
+(below), the call count is ⌈N/16⌉ + ⌈sN/16⌉ for the unmerged strategies and ⌈N/16⌉ for `merged`.
 
 `separate_1out` separates the effect of merging from the effect of the different filter and project prompts:
 `merged` vs. `separate_1out` is the merge alone.
@@ -74,22 +76,27 @@ python3 sem_merge_evaluation/make_dataset.py --n 2000 --pool all
 ```bash
 W="uv run --project $HOME/Projects/WSIAF python"
 $W sem_merge_evaluation/run.py --dry-run                     # the plan and the exact instructions, no LLM calls
-$W sem_merge_evaluation/run.py                               # all workloads x strategies, n=500, gpt-6-luna, run 1
+$W sem_merge_evaluation/run.py                               # all workloads x strategies, n=500, gpt-6-luna, run 1,
+                                                             # 16 rows per call, 16 concurrent requests
 $W sem_merge_evaluation/run.py --runs 1 2 3 --n 500
 $W sem_merge_evaluation/run.py --workloads ff_same fp_same --strategies separate merged
-$W sem_merge_evaluation/run.py --mode batch --chunk-size 20  # WSIAF row_marshal: 20 rows per call
+$W sem_merge_evaluation/run.py --mode row                    # one call per row (WSIAF's MCP default)
 python3 sem_merge_evaluation/analyze.py                      # -> sem_merge_evaluation/analysis/report.md
 ```
 
 - `--model` (default `gpt-6-luna`, the paper's `gpt6luna`) takes any litellm model. WSIAF's `.env` still names
   `o4-mini`, which OpenAI has deprecated, so the `.env` model is not used.
-- `--mode row` (default) makes one call per row, as WSIAF's MCP server does. `--mode batch` puts `--chunk-size`
-  rows into each call.
-- Rows go to the operators in chunks (`--chunk-size`, default 50 for row mode and 20 for batch mode), with
-  `--parallel` chunks at a time (default 4). In row mode, litellm also runs each chunk's calls concurrently.
-  Latency depends on these settings, so keep them the same across the runs you compare.
-- **Failures:** WSIAF's per-row `semantic_filter` silently keeps a row when its LLM call fails, and
-  `semantic_project` crashes. `run.py` makes any failed call raise and retries the chunk (`--retries`, default
+- **Execution matches the iPDB runs** (`evaluation/run.sh`: `ml_batch_size = 16`, `llm_no_threads = 16`).
+  `--mode batch` (default) marshals `--batch-size` rows (default 16) into each call (WSIAF `row_marshal=True`),
+  with `--workers` requests in flight (default 16). `--mode row` makes one call per row; rows are still handed to
+  the operator in groups of `--batch-size`, and `--workers` remains the total number of concurrent requests
+  (litellm's own pool inside each group is limited to 1). Stages run one after another, so there are never more
+  than `--workers` requests in flight. Latency depends on these settings, so keep them the same across the runs
+  you compare.
+- **Failures:** WSIAF's per-row `semantic_filter` silently keeps a row when its LLM call fails, its batched
+  form silently drops rows when the model returns fewer results than rows, and `semantic_project` crashes or
+  misaligns rows. `run.py` makes any failed call, and any batched response whose result count differs from the
+  number of rows, raise and retries the batch (`--retries`, default
   2). A run that still fails is written to `*.failed.json` and listed at the top of the report. Retried
   attempts' tokens are not counted.
 - Finished runs are skipped; `--force` reruns them.

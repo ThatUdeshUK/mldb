@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -20,7 +21,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from common import (DEFAULT_N, DEFAULT_POOL, DEFAULT_SEED, OPS, RESULTS_DIR, WORKLOADS, WSIAF_DIR, Op,
+from common import (DEFAULT_BATCH_SIZE, DEFAULT_MODE, DEFAULT_N, DEFAULT_POOL, DEFAULT_SEED, DEFAULT_WORKERS, OPS, RESULTS_DIR, WORKLOADS, WSIAF_DIR, Op,
                     dataset_name, dataset_path, load_dataset, stem, strategies_for)
 
 try:
@@ -43,6 +44,9 @@ _batch_completion = litellm.batch_completion
 
 
 def _strict_batch_completion(*args, **kwargs):
+    # One request at a time per chunk: concurrency comes only from the --workers chunks running in parallel,
+    # so at most --workers LLM requests are in flight (litellm's default is 100 per call).
+    kwargs["max_workers"] = 1
     responses = _batch_completion(*args, **kwargs)
     errors = [r for r in responses if isinstance(r, Exception)]
     if errors:
@@ -51,6 +55,25 @@ def _strict_batch_completion(*args, **kwargs):
 
 
 litellm.batch_completion = _strict_batch_completion
+
+# Batched (row-marshalled) calls: WSIAF's semantic_filter silently drops rows when the model returns fewer
+# results than rows, and semantic_project misaligns them. Check the result count against the rows in the prompt.
+_completion = litellm.completion
+_ROW_RE = re.compile(r"^\[\d+\] ", re.M)
+
+
+def _strict_completion(*args, **kwargs):
+    response = _completion(*args, **kwargs)
+    prompt = kwargs.get("messages", [{}])[-1].get("content", "")
+    if "\n\nRows:\n" in prompt:
+        expected = len(_ROW_RE.findall(prompt.split("\n\nRows:\n", 1)[1]))
+        got = json.loads(response.choices[0].message.content).get("results", [])
+        if len(got) != expected:
+            raise ValueError(f"batched call returned {len(got)} results for {expected} rows")
+    return response
+
+
+litellm.completion = _strict_completion
 
 
 @dataclass
@@ -71,7 +94,7 @@ class Ctx:
     cfg: "ModelConfig"
     batched: bool            # WSIAF row_marshal: several rows per prompt instead of one call per row
     chunk_size: int
-    parallel: int
+    workers: int
     max_retries: int
     stages: list[Stage] = field(default_factory=list)
 
@@ -114,7 +137,7 @@ def _chunked(ctx: Ctx, stage: Stage, rows: list[dict], columns: list[str], call)
 
     stage.rows_in = len(rows)
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=max(1, ctx.parallel)) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, ctx.workers)) as pool:
         done = list(pool.map(one, chunks))
     stage.latency_s = time.perf_counter() - t0
     for _, res, attempt in done:
@@ -187,12 +210,6 @@ def run_strategy(ctx: Ctx, strategy: str, ops: list[Op], rows: list[dict]) -> di
         pipeline(op2, op1, single_output=False)
     elif strategy == "separate_1out":
         pipeline(op1, op2, single_output=True)
-    elif strategy == "independent":
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f1 = pool.submit(execute, ctx, op1, rows, f"a:{op1.name}", False)
-            f2 = pool.submit(execute, ctx, op2, rows, f"b:{op2.name}", False)
-            record(op1, f1.result())
-            record(op2, f2.result())
     elif strategy == "merged":
         merged = run_project(ctx, ops, rows, f"merged:{op1.name}+{op2.name}")
         for k, vals in merged.items():
@@ -220,11 +237,14 @@ def main():
     ap.add_argument("--runs", type=int, nargs="+", default=[1])
     ap.add_argument("--model", default=DEFAULT_MODEL, help="litellm model (default %(default)s)")
     ap.add_argument("--base-url", help="default: LLM_BASE_URL from WSIAF's .env")
-    ap.add_argument("--mode", choices=["row", "batch"], default="row",
-                    help="row: one LLM call per row (WSIAF's default); batch: chunk-size rows per call "
-                         "(WSIAF row_marshal=True)")
-    ap.add_argument("--chunk-size", type=int, help="rows per operator invocation (default: 50 row, 20 batch)")
-    ap.add_argument("--parallel", type=int, default=4, help="concurrent chunks per stage (default %(default)s)")
+    ap.add_argument("--mode", choices=["row", "batch"], default=DEFAULT_MODE,
+                    help="batch (default, as iPDB): --batch-size rows per LLM call (WSIAF row_marshal=True); "
+                         "row: one LLM call per row")
+    ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                    help="rows per operator invocation, i.e. per LLM call in batch mode (default %(default)s, "
+                         "iPDB ml_batch_size)")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help="concurrent LLM requests (default %(default)s, iPDB llm_no_threads)")
     ap.add_argument("--retries", type=int, default=2, help="retries of a failed chunk (default %(default)s)")
     ap.add_argument("--force", action="store_true", help="rerun finished runs")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the prompts, no LLM calls")
@@ -240,7 +260,7 @@ def main():
         subprocess.run([sys.executable, str(dataset_path(data).parent.parent / "make_dataset.py"),
                         "--n", str(args.n), "--seed", str(args.seed), "--pool", args.pool], check=True)
     rows = load_dataset(data)
-    chunk_size = args.chunk_size or (50 if args.mode == "row" else 20)
+    chunk_size = args.batch_size
 
     RESULTS_DIR.mkdir(exist_ok=True)
     for workload in args.workloads:
@@ -266,7 +286,7 @@ def main():
                             print(f"      semantic_{o.kind}[{o.column}] {inst}")
                     continue
 
-                ctx = Ctx(cfg, args.mode == "batch", chunk_size, args.parallel, args.retries)
+                ctx = Ctx(cfg, args.mode == "batch", chunk_size, args.workers, args.retries)
                 print(f"run   {s} ...", end="", flush=True)
                 t0 = time.perf_counter()
                 status, error, outputs = "ok", None, {}
@@ -278,7 +298,7 @@ def main():
                 result = {
                     "meta": {"workload": workload, "strategy": strategy, "ops": [o.name for o in ops],
                              "model": model, "mode": args.mode, "data": data, "n": len(rows), "run": run,
-                             "chunk_size": chunk_size, "parallel": args.parallel,
+                             "chunk_size": chunk_size, "workers": args.workers,
                              "started": dt.datetime.now().isoformat(timespec="seconds"),
                              "wsiaf_commit": wsiaf_commit()},
                     "status": status, "error": error, "latency_s": wall,

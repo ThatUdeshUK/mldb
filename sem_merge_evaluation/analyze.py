@@ -110,6 +110,8 @@ def main():
         if not STEM_RE.match(p.stem):
             continue
         res = json.loads(p.read_text())
+        if res["meta"]["strategy"] not in STRATEGIES:  # dropped strategies (e.g. the old "independent")
+            continue
         d = res["meta"]["data"]
         if d not in datasets:
             datasets[d] = {r["id"]: r for r in load_dataset(d)}
