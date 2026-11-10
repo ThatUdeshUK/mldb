@@ -31,6 +31,9 @@ US_RATING = {"G": "G", "PG": "PG", "PG-13": "PG-13", "R": "R", "NC-17": "NC-17",
 
 
 def build(pool: str) -> list[dict]:
+    if not (BENCHMARK_DIR / "movie_info.csv").exists():
+        raise SystemExit(f"{BENCHMARK_DIR}/movie_info.csv not found: point SEM_MERGE_BENCHMARK_DIR at the semantic "
+                         "movies benchmark directory (movie.csv, movie_info.csv)")
     csv.field_size_limit(sys.maxsize)
     titles = {}
     with open(BENCHMARK_DIR / "movie.csv", newline="", encoding="utf-8") as f:

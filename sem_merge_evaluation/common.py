@@ -2,13 +2,15 @@
 
 import csv
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-BENCHMARK_DIR = REPO / "benchmark"
+# Semantic movies CSVs (movie.csv, movie_info.csv); SEM_MERGE_BENCHMARK_DIR overrides.
+BENCHMARK_DIR = Path(os.environ.get("SEM_MERGE_BENCHMARK_DIR", REPO / "benchmark"))
 DATA_DIR = HERE / "data"
 RESULTS_DIR = HERE / "results"
 ANALYSIS_DIR = HERE / "analysis"

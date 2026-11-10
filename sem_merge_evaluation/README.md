@@ -65,6 +65,7 @@ python3 sem_merge_evaluation/make_dataset.py --n 2000 --pool all
   missing for most rows, and those rows are left out of the quality metrics for those operators.
 - Default sample (rated, n=500, seed 42): comedy 106, children 94, comedy ∧ children 34, English 487/493,
   comedy ∧ English 103.
+- The source CSVs are read from `<repo>/benchmark/`; set `SEM_MERGE_BENCHMARK_DIR` to use another location.
 - `run.py` builds a missing dataset automatically. Files go to `data/movies_<pool>_n<N>_s<seed>.csv`
   (gitignored; the sample is deterministic for a given seed).
 
